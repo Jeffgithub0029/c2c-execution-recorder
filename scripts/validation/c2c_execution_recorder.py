@@ -216,6 +216,30 @@ def get_git_state(cwd: Path) -> Tuple[str, bool, Dict[str, Any], Dict[str, str]]
     return git_commit, dirty, fingerprint, manifest
 
 
+def snapshot_ignored_files(cwd: Path) -> Dict[str, str]:
+    """Bounded net-state hash audit for Git-ignored files, not an OS sandbox."""
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+        cwd=cwd, capture_output=True, check=True,
+    )
+    paths = [os.fsdecode(p) for p in result.stdout.split(b"\x00") if p]
+    if len(paths) > 10000:
+        raise ValueError("Ignored-file audit exceeds 10000 entries")
+    manifest: Dict[str, str] = {}
+    for path in paths:
+        file_path = cwd / path
+        if file_path.is_symlink():
+            manifest[path] = f"SYMLINK:{os.readlink(file_path)}"
+        elif file_path.is_file():
+            digest = compute_file_sha256(file_path)
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                raise ValueError(f"Ignored-file hash unavailable: {path}")
+            manifest[path] = digest
+        else:
+            raise ValueError(f"Ignored-file entry is not a regular file or symlink: {path}")
+    return manifest
+
+
 def collect_target_file_hashes(
     cwd: Path,
     explicit_targets: List[str] | None,
@@ -387,6 +411,7 @@ def main() -> int:
     parser.add_argument("--project-type", choices=["python", "node", "go", "bash_probe", "rust", "generic"], default=None, help="Explicit project type")
     parser.add_argument("--target-files", nargs="*", default=None, help="Explicit files to calculate SHA-256 for")
     parser.add_argument("--allowed-scope", nargs="*", default=None, help="Allowed directory or file scopes for scope containment gate")
+    parser.add_argument("--audit-ignored", action="store_true", help="Hash up to 10000 Git-ignored files before/after (requires --allowed-scope)")
     parser.add_argument("cmd", nargs=argparse.REMAINDER, help="Test command to run (after --)")
 
     args = parser.parse_args()
@@ -401,7 +426,23 @@ def main() -> int:
         print("Error: Empty command after --", file=sys.stderr)
         return 1
 
+    if args.audit_ignored and not args.allowed_scope:
+        print("[C2C Record v2.0] ERROR: --audit-ignored requires --allowed-scope", file=sys.stderr)
+        return 2
+
     cwd = Path.cwd()
+    if args.audit_ignored:
+        try:
+            repo_root = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(f"[C2C Record v2.0] FAIL-CLOSED ERROR: Cannot determine repository root: {exc}", file=sys.stderr)
+            return 2
+        if cwd.resolve() != Path(repo_root).resolve():
+            print("[C2C Record v2.0] FAIL-CLOSED ERROR: --audit-ignored requires running from repository root", file=sys.stderr)
+            return 2
     this_script = Path(__file__).resolve()
     recorder_hash = compute_file_sha256(this_script)
 
@@ -418,6 +459,14 @@ def main() -> int:
 
     # 1. Pre-run baseline status and content hash manifest
     pre_commit, pre_dirty, pre_fingerprint, pre_manifest = get_git_state(cwd)
+    pre_ignored: Dict[str, str] = {}
+    if args.audit_ignored:
+        try:
+            pre_ignored = snapshot_ignored_files(cwd)
+            pre_manifest.update(pre_ignored)
+        except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+            print(f"[C2C Record v2.0] FAIL-CLOSED ERROR: Pre-run ignored-file audit failed: {exc}", file=sys.stderr)
+            return 2
 
     # 2. Execute command
     cmd_record, failures, redactions = run_command_and_record(
@@ -426,6 +475,13 @@ def main() -> int:
 
     # 3. Post-run status and content hash manifest
     post_commit, post_dirty, post_fingerprint, post_manifest = get_git_state(cwd)
+    ignored_audit_error = None
+    if args.audit_ignored:
+        try:
+            post_ignored = snapshot_ignored_files(cwd)
+            post_manifest.update(post_ignored)
+        except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+            ignored_audit_error = str(exc)
 
     # 4. Target file hashes collected post-run (保证哈希反映最终产物真实状态)
     try:
@@ -456,6 +512,8 @@ def main() -> int:
     fingerprint["pre_run_commit"] = pre_commit
     fingerprint["post_run_commit"] = post_commit
     fingerprint["head_changed"] = head_changed
+    if args.audit_ignored:
+        fingerprint["ignored_file_audit"] = "failed" if ignored_audit_error else "completed"
     invalid_targets = [p for p, h in target_hashes.items()
                        if h == "sha256:file_not_found" or h.startswith("sha256:error_")]
     if invalid_targets:
@@ -489,6 +547,10 @@ def main() -> int:
         if invalid_targets:
             scope_passed = False
             violations.extend(f"TARGET_HASH_UNAVAILABLE:{p}" for p in invalid_targets)
+
+        if ignored_audit_error:
+            scope_passed = False
+            violations.append("IGNORED_FILE_AUDIT_FAILED")
 
         for tf in sorted(all_eval_paths):
             matched = False

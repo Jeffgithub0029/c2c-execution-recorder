@@ -58,7 +58,7 @@ def test_existing_out_of_scope_changes_fail_closed(tmp_path: Path, tracked: bool
 @pytest.mark.parametrize("ignored_path", [
     "tmp/result.txt", ".pytest_cache/result.txt", "outside/__pycache__/result.pyc", "outside/result.pyc",
 ])
-@pytest.mark.xfail(strict=True, reason="Git status cannot observe ignored writes; use an OS sandbox")
+@pytest.mark.xfail(strict=True, reason="Default Git-status mode cannot observe ignored writes; use --audit-ignored for net changes")
 def test_ignored_out_of_scope_write_is_not_yet_contained(tmp_path: Path, ignored_path: str):
     _repo(tmp_path)
     (tmp_path / ".gitignore").write_text("tmp/\n.pytest_cache/\n__pycache__/\n*.pyc\n", encoding="utf-8")
