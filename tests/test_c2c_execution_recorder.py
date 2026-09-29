@@ -117,3 +117,44 @@ def test_scope_gate_fails_closed_when_git_is_unavailable(tmp_path: Path):
     )
     assert result.returncode == 2
     assert json.loads(receipt.read_text())["working_tree_fingerprint"]["scope_containment"] == "failed"
+
+
+def test_compute_file_sha256_symlink_rejected(tmp_path: Path):
+    target = tmp_path / "target.txt"
+    target.write_text("content", encoding="utf-8")
+    sym = tmp_path / "sym.txt"
+    sym.symlink_to(target)
+
+    assert compute_file_sha256(sym) == "sha256:error_symlink_rejected"
+
+
+def test_command_string_secret_redaction(tmp_path: Path):
+    recorder = Path(__file__).resolve().parents[1] / "scripts" / "validation" / "c2c_execution_recorder.py"
+    receipt = tmp_path / "receipt.json"
+    token = "secret_token_12345678"
+    result = subprocess.run(
+        [sys.executable, str(recorder), "--output", str(receipt),
+         "--", sys.executable, "-c", "print('ok')", f"--token={token}"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    raw_content = receipt.read_text(encoding="utf-8")
+    assert token not in raw_content
+    payload = json.loads(raw_content)
+    assert "[REDACTED]" in payload["commands"][0]["command"]
+    assert payload["sanitization"]["redactions"] >= 1
+
+
+def test_sanitization_size_bytes_matches_file_size(tmp_path: Path):
+    recorder = Path(__file__).resolve().parents[1] / "scripts" / "validation" / "c2c_execution_recorder.py"
+    receipt = tmp_path / "receipt.json"
+    result = subprocess.run(
+        [sys.executable, str(recorder), "--output", str(receipt),
+         "--", sys.executable, "-c", "print('ok')"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    recorded_size = payload["sanitization"]["size_bytes"]
+    actual_size = len(receipt.read_bytes())
+    assert recorded_size == actual_size

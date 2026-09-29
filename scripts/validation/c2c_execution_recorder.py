@@ -7,7 +7,7 @@
 3. 提取当前 git 身份指纹（commit + dirty 状态 + pre/post 内容与状态级哈希清单），
 4. 验证任务范围遏制（Scope Containment）：
    - 支持新增、修改、以及对已有 clean tracked 文件的删除与重命名捕获；
-   - 发生任何越界变动时强制以 exit_code=2 异常退出（Fail-Closed）；
+   - 对 Git 可见的最终状态越界变动强制以 exit_code=2 异常退出；忽略文件及瞬态变动不在此范围；
 5. 计算被测代码、测试文件以及 recorder 自身的 SHA-256 密码学指纹，
 6. 执行本地脱敏，将结构化产物写入指定路径（默认 tmp/execution_summary.json）。
 """
@@ -82,6 +82,8 @@ def sanitize_text(text: str) -> Tuple[str, int]:
 
 def compute_file_sha256(file_path: Path) -> str:
     """计算单个文件的 SHA-256（带 sha256: 前缀）."""
+    if file_path.is_symlink():
+        return "sha256:error_symlink_rejected"
     if not file_path.is_file():
         return "sha256:file_not_found"
     h = hashlib.sha256()
@@ -92,6 +94,31 @@ def compute_file_sha256(file_path: Path) -> str:
         return f"sha256:{h.hexdigest()}"
     except Exception as e:
         return f"sha256:error_{e}"
+
+
+def _check_target_path_security(cwd: Path, p_str: str) -> Path:
+    """验证目标文件路径位于仓库内部且非符号链接.
+
+    若为符号链接、路径穿越或超出仓库根目录，直接抛出 ValueError (Fail-Closed).
+    """
+    raw_path = Path(p_str)
+    abs_path = raw_path if raw_path.is_absolute() else (cwd / raw_path)
+
+    if abs_path.is_symlink():
+        raise ValueError(
+            f"Target file '{p_str}' is a symlink; symlinks are rejected for fingerprinting."
+        )
+
+    cwd_resolved = cwd.resolve()
+    try:
+        resolved = abs_path.resolve()
+        resolved.relative_to(cwd_resolved)
+    except ValueError:
+        raise ValueError(
+            f"Target file '{p_str}' resolves outside repository root '{cwd}'."
+        )
+
+    return abs_path
 
 
 def get_git_state(cwd: Path) -> Tuple[str, bool, Dict[str, Any], Dict[str, str]]:
@@ -114,46 +141,69 @@ def get_git_state(cwd: Path) -> Tuple[str, bool, Dict[str, Any], Dict[str, str]]
     dirty = False
 
     try:
-        # 强制使用 -uall，逐文件递归展开所有 untracked 路径
+        # 强制使用 --porcelain=v1 与 -z，以 NUL 分隔处理含空格、引号及重命名的路径
         res_status = subprocess.run(
-            ["git", "status", "--porcelain", "-uall"],
+            ["git", "status", "--porcelain=v1", "-z", "-uall"],
             cwd=cwd,
             capture_output=True,
-            text=True,
             check=True,
         )
-        status_lines = res_status.stdout.splitlines()
-        dirty = len(status_lines) > 0
+        raw_bytes = res_status.stdout
+        dirty = len(raw_bytes) > 0
 
-        for line in status_lines:
-            if not line.strip():
-                continue
-            status_code = line[:2]
-            raw_path = line[3:].strip()
-
-            # 处理重命名：形如 "R  old_path -> new_path"
-            if " -> " in raw_path:
-                parts = raw_path.split(" -> ")
-                old_p = parts[0].strip().strip('"')
-                new_p = parts[1].strip().strip('"')
-                modified_files.extend([old_p, new_p])
-                manifest[old_p] = f"RENAMED_FROM:{status_code}"
-                fp_new = cwd / new_p
-                manifest[new_p] = compute_file_sha256(fp_new) if fp_new.is_file() else f"STATUS:{status_code}"
+        entries = raw_bytes.split(b"\x00")
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            if not entry:
+                i += 1
                 continue
 
-            file_name = raw_path.strip('"')
+            # 每个条目前 2 字节为状态码，第 3 字节为空格
+            status_code = entry[:2].decode("ascii", errors="replace")
+            path_bytes = entry[3:]
+            file_name = os.fsdecode(path_bytes)
+
+            # 处理重命名/复制：形如 'R  new_path\0old_path\0'
+            if "R" in status_code or "C" in status_code:
+                i += 1
+                if i < len(entries):
+                    orig_file_name = os.fsdecode(entries[i])
+                    modified_files.extend([orig_file_name, file_name])
+                    manifest[orig_file_name] = f"RENAMED_FROM:{status_code}"
+                    fp_new = cwd / file_name
+                    if fp_new.is_symlink():
+                        try:
+                            target = os.readlink(fp_new)
+                            manifest[file_name] = f"SYMLINK:{status_code}:{target}"
+                        except OSError:
+                            manifest[file_name] = f"SYMLINK:{status_code}"
+                    elif fp_new.is_file():
+                        manifest[file_name] = compute_file_sha256(fp_new)
+                    else:
+                        manifest[file_name] = f"STATUS:{status_code}"
+                i += 1
+                continue
+
             if status_code == "??":
                 untracked_files.append(file_name)
             else:
                 modified_files.append(file_name)
 
             fp = cwd / file_name
-            if fp.is_file():
+            if fp.is_symlink():
+                try:
+                    target = os.readlink(fp)
+                    manifest[file_name] = f"SYMLINK:{status_code}:{target}"
+                except OSError:
+                    manifest[file_name] = f"SYMLINK:{status_code}"
+            elif fp.is_file():
                 manifest[file_name] = compute_file_sha256(fp)
             else:
                 # 文件不存在（如已删除），显式记录状态码作为指纹，防止删除逃逸
                 manifest[file_name] = f"DELETED_OR_MISSING:{status_code}"
+
+            i += 1
 
         fingerprint = {
             "modified_files": sorted(set(modified_files)),
@@ -173,11 +223,23 @@ def collect_target_file_hashes(
     modified_files: List[str],
 ) -> Dict[str, str]:
     """收集关键被审查文件和测试文件的 SHA-256 指纹."""
-    candidates = set()
-    if explicit_targets:
-        candidates.update(explicit_targets)
+    cwd_resolved = cwd.resolve()
+    hashes: Dict[str, str] = {}
 
-    # 从命令行参数提取可能的目标文件
+    if explicit_targets:
+        for t in explicit_targets:
+            abs_p = _check_target_path_security(cwd, t)
+            try:
+                rel_str = str(abs_p.resolve().relative_to(cwd_resolved))
+            except ValueError:
+                rel_str = str(abs_p.relative_to(cwd))
+            if abs_p.is_file():
+                hashes[rel_str] = compute_file_sha256(abs_p)
+            else:
+                hashes[rel_str] = "sha256:file_not_found"
+        return hashes
+
+    candidates = set()
     for arg in cmd:
         if arg.endswith(SOURCE_EXTENSIONS):
             candidates.add(arg)
@@ -192,17 +254,25 @@ def collect_target_file_hashes(
             if m.endswith(SOURCE_EXTENSIONS):
                 candidates.add(m)
 
-    hashes = {}
     for rel_path in sorted(candidates):
-        target_path = Path(rel_path)
-        if not target_path.is_absolute():
-            target_path = cwd / target_path
-        if target_path.is_file():
+        raw_p = Path(rel_path)
+        abs_p = raw_p if raw_p.is_absolute() else (cwd / raw_p)
+        if abs_p.is_symlink():
+            raise ValueError(
+                f"Target file candidate '{rel_path}' is a symlink; symlinks are rejected."
+            )
+        try:
+            resolved_p = abs_p.resolve()
+            resolved_p.relative_to(cwd_resolved)
+        except ValueError:
+            continue
+
+        if abs_p.is_file():
             try:
-                rel_str = str(target_path.relative_to(cwd))
+                rel_str = str(resolved_p.relative_to(cwd_resolved))
             except ValueError:
-                rel_str = target_path.name
-            hashes[rel_str] = compute_file_sha256(target_path)
+                rel_str = str(abs_p.relative_to(cwd))
+            hashes[rel_str] = compute_file_sha256(abs_p)
 
     return hashes
 
@@ -277,7 +347,12 @@ def run_command_and_record(
     )
     duration = round(time.perf_counter() - start_time, 2)
     raw_output = proc.stdout + ("\n" + proc.stderr if proc.stderr else "")
-    sanitized_output, redactions = sanitize_text(raw_output)
+    sanitized_output, out_redactions = sanitize_text(raw_output)
+
+    # 对记录的命令字符串做尽力脱敏（Best-effort regex redaction）
+    raw_command_str = " ".join(cmd)
+    sanitized_command_str, cmd_redactions = sanitize_text(raw_command_str)
+    redactions = out_redactions + cmd_redactions
 
     tests_summary = parse_test_summary(sanitized_output, project_type, proc.returncode)
     failures = []
@@ -296,7 +371,7 @@ def run_command_and_record(
 
     cmd_record = {
         "command_id": command_id,
-        "command": " ".join(cmd),
+        "command": sanitized_command_str,
         "exit_code": proc.returncode,
         "duration_sec": duration,
         "tests": tests_summary,
@@ -332,19 +407,37 @@ def main() -> int:
 
     project_type = args.project_type or infer_project_type(command)
 
+    # 0. Early validation of explicit target files
+    if args.target_files:
+        for tf in args.target_files:
+            try:
+                _check_target_path_security(cwd, tf)
+            except ValueError as e:
+                print(f"[C2C Record v2.0] ERROR: Invalid target file: {e}", file=sys.stderr)
+                return 2
+
     # 1. Pre-run baseline status and content hash manifest
-    git_commit, dirty, pre_fingerprint, pre_manifest = get_git_state(cwd)
+    pre_commit, pre_dirty, pre_fingerprint, pre_manifest = get_git_state(cwd)
 
-    # 2. Target file hashes
-    target_hashes = collect_target_file_hashes(cwd, args.target_files, command, pre_fingerprint.get("modified_files", []))
-
-    # 3. Execute command
+    # 2. Execute command
     cmd_record, failures, redactions = run_command_and_record(
         command, cwd, project_type=project_type, command_id=args.command_id
     )
 
-    # 4. Post-run status and content hash manifest
-    _, _, post_fingerprint, post_manifest = get_git_state(cwd)
+    # 3. Post-run status and content hash manifest
+    post_commit, post_dirty, post_fingerprint, post_manifest = get_git_state(cwd)
+
+    # 4. Target file hashes collected post-run (保证哈希反映最终产物真实状态)
+    try:
+        target_hashes = collect_target_file_hashes(
+            cwd,
+            args.target_files,
+            command,
+            post_fingerprint.get("modified_files", []) + post_fingerprint.get("untracked_files", []),
+        )
+    except ValueError as e:
+        print(f"[C2C Record v2.0] ERROR: Target file validation failed: {e}", file=sys.stderr)
+        return 2
 
     # 基于内容哈希精确比对：任何新增、删除、重命名或既有文件内容变动均计入 delta
     all_status_keys = set(pre_manifest.keys()) | set(post_manifest.keys())
@@ -353,43 +446,50 @@ def main() -> int:
         if pre_manifest.get(k) != post_manifest.get(k)
     ])
 
+    # Only the net pre/post HEAD state is observable, not transient revisions.
+    head_changed = (pre_commit != post_commit)
+
     fingerprint = post_fingerprint
-    fingerprint["pre_run_dirty"] = dirty
+    fingerprint["pre_run_dirty"] = pre_dirty
     fingerprint["post_run_delta"] = changed_delta
     fingerprint["target_file_hashes"] = target_hashes
+    fingerprint["pre_run_commit"] = pre_commit
+    fingerprint["post_run_commit"] = post_commit
+    fingerprint["head_changed"] = head_changed
+    invalid_targets = [p for p, h in target_hashes.items()
+                       if h == "sha256:file_not_found" or h.startswith("sha256:error_")]
+    if invalid_targets:
+        fingerprint["invalid_target_hashes"] = invalid_targets
 
     # 5. Scope containment verification (B3, 内容与状态级全闭环比对)
     if args.allowed_scope:
         fingerprint["allowed_scope"] = args.allowed_scope
         fingerprint["task_target_files"] = sorted(target_hashes.keys())
 
-        # 检验集包含：显式 target 文件 + 命令执行期间发生内容/状态变动的所有文件
+        # 检验集包含：显式 target 文件 + 命令执行期间发生内容/状态变动的所有文件。
+        # 绝不隐藏任何目录或文件后缀全局豁免，亦不给 output 产物路径任何白名单豁免；
+        # 命令若写出越界文件，即使路径与 output 相同亦判定越界。
         all_eval_paths = set(target_hashes.keys()) | set(changed_delta)
-        out_path_eval = Path(args.output)
-        if not out_path_eval.is_absolute():
-            out_path_eval = cwd / out_path_eval
-        try:
-            recorder_out_rel = str(out_path_eval.relative_to(cwd))
-        except ValueError:
-            recorder_out_rel = out_path_eval.name
-
-        # 零隐式白名单：仅精确排除 recorder 自身声明的 output 单个产物文件。
-        # 绝不隐藏任何目录或文件后缀全局豁免（如 tmp/、.pytest_cache/、__pycache__、*.pyc），
-        # 真正做到“任何越界工作树变动均 Fail-Closed”。
-        all_eval_paths = {
-            p for p in all_eval_paths
-            if p != recorder_out_rel
-        }
 
         # Git is the scope oracle. Without a valid pre/post status (or a commit),
         # an empty delta is not proof that the command stayed in bounds.
         git_unavailable = (
-            git_commit == "unknown_commit"
+            pre_commit == "unknown_commit"
+            or post_commit == "unknown_commit"
             or "error" in pre_fingerprint
             or "error" in post_fingerprint
         )
         scope_passed = not git_unavailable
         violations = ["GIT_STATE_UNAVAILABLE"] if git_unavailable else []
+
+        if head_changed:
+            scope_passed = False
+            violations.append(f"HEAD_CHANGED:{pre_commit}->{post_commit}")
+
+        if invalid_targets:
+            scope_passed = False
+            violations.extend(f"TARGET_HASH_UNAVAILABLE:{p}" for p in invalid_targets)
+
         for tf in sorted(all_eval_paths):
             matched = False
             for scope in args.allowed_scope:
@@ -415,8 +515,8 @@ def main() -> int:
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "recorder_sha256": recorder_hash,
         "project_type": project_type,
-        "git_commit": git_commit,
-        "dirty_tree": dirty,
+        "git_commit": post_commit,
+        "dirty_tree": post_dirty,
         "working_tree_fingerprint": fingerprint,
         "commands": [cmd_record],
         "failures": failures,
@@ -427,20 +527,41 @@ def main() -> int:
         },
     }
 
-    content_str = json.dumps(record_payload, indent=2, ensure_ascii=False)
-    record_payload["sanitization"]["size_bytes"] = len(content_str.encode("utf-8"))
-    out_path.write_text(json.dumps(record_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    # 循环收敛计算 size_bytes，确保元数据大小与最终 UTF-8 JSON 字节数严格一致
+    size = 0
+    serialized = ""
+    for _ in range(5):
+        record_payload["sanitization"]["size_bytes"] = size
+        serialized = json.dumps(record_payload, indent=2, ensure_ascii=False)
+        new_size = len(serialized.encode("utf-8"))
+        if new_size == size:
+            break
+        size = new_size
+
+    out_path.write_text(serialized, encoding="utf-8")
 
     print(f"[C2C Record v2.0] Wrote execution summary to {out_path}")
     print(
-        f"[C2C Record v2.0] Type: {project_type}, Commit: {git_commit[:8]}, Dirty: {dirty}, Exit: {cmd_record['exit_code']}, Tests: {cmd_record['tests']}"
+        f"[C2C Record v2.0] Type: {project_type}, Commit: {post_commit[:8]}, Dirty: {post_dirty}, Exit: {cmd_record['exit_code']}, Tests: {cmd_record['tests']}"
     )
+
+    # Fail-Closed 铁律：命令执行期间若变更 HEAD，即使未指定 allowed_scope 亦强制以 exit code 2 阻断
+    if head_changed and not args.allowed_scope:
+        print(
+            f"[C2C Record v2.0] FAIL-CLOSED ERROR: Git HEAD changed during command execution ({pre_commit} -> {post_commit})",
+            file=sys.stderr,
+        )
+        return 2
+
+    if invalid_targets and not args.allowed_scope:
+        print("[C2C Record v2.0] FAIL-CLOSED ERROR: Target hash unavailable", file=sys.stderr)
+        return 2
 
     # Fail-Closed 铁律：若 scope_containment 失败，强制返回 exit code 2 阻断
     if args.allowed_scope and fingerprint.get("scope_containment") != "passed":
         print(
             f"[C2C Record v2.0] FAIL-CLOSED ERROR: Scope containment failed! Violations: {fingerprint.get('scope_violations')}",
-            file=sys.stderr
+            file=sys.stderr,
         )
         return 2
 
