@@ -112,12 +112,14 @@ def _check_target_path_security(cwd: Path, p_str: str) -> Path:
     cwd_resolved = cwd.resolve()
     try:
         resolved = abs_path.resolve()
-        resolved.relative_to(cwd_resolved)
+        relative = resolved.relative_to(cwd_resolved)
     except ValueError:
         raise ValueError(
             f"Target file '{p_str}' resolves outside repository root '{cwd}'."
         )
 
+    if ".git" in relative.parts:
+        raise ValueError(f"Target file '{p_str}' is Git metadata, outside snapshot coverage.")
     return abs_path
 
 
@@ -376,10 +378,19 @@ def run_command_and_record(
     # 对记录的命令字符串做尽力脱敏（Best-effort regex redaction）
     raw_command_str = " ".join(cmd)
     sanitized_command_str, cmd_redactions = sanitize_text(raw_command_str)
-    redactions = out_redactions + cmd_redactions
+    sanitized_argv = []
+    argv_redactions = 0
+    for arg in cmd:
+        sanitized_arg, count = sanitize_text(arg)
+        sanitized_argv.append(sanitized_arg)
+        argv_redactions += count
+    argv_bytes = json.dumps(sanitized_argv, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    redactions = out_redactions + cmd_redactions + argv_redactions
 
     tests_summary = parse_test_summary(sanitized_output, project_type, proc.returncode)
     failures = []
+    if tests_summary["failed"] > 0:
+        failures.append(f"Test summary reports {tests_summary['failed']} failed")
     if proc.returncode != 0:
         for line in sanitized_output.splitlines():
             clean_line = line.strip()
@@ -396,6 +407,8 @@ def run_command_and_record(
     cmd_record = {
         "command_id": command_id,
         "command": sanitized_command_str,
+        "command_argv_sha256": "sha256:" + hashlib.sha256(argv_bytes).hexdigest(),
+        "command_args_redacted": bool(cmd_redactions or argv_redactions),
         "exit_code": proc.returncode,
         "duration_sec": duration,
         "tests": tests_summary,
@@ -428,6 +441,10 @@ def main() -> int:
 
     if args.audit_ignored and not args.allowed_scope:
         print("[C2C Record v2.0] ERROR: --audit-ignored requires --allowed-scope", file=sys.stderr)
+        return 2
+
+    if args.allowed_scope and any(".git" in Path(scope).parts for scope in args.allowed_scope):
+        print("[C2C Record v2.0] ERROR: Git metadata is outside snapshot coverage", file=sys.stderr)
         return 2
 
     cwd = Path.cwd()
@@ -475,6 +492,7 @@ def main() -> int:
 
     # 3. Post-run status and content hash manifest
     post_commit, post_dirty, post_fingerprint, post_manifest = get_git_state(cwd)
+    post_git_manifest = post_manifest.copy()
     ignored_audit_error = None
     if args.audit_ignored:
         try:
@@ -508,6 +526,7 @@ def main() -> int:
     fingerprint = post_fingerprint
     fingerprint["pre_run_dirty"] = pre_dirty
     fingerprint["post_run_delta"] = changed_delta
+    fingerprint["post_run_git_manifest"] = post_git_manifest
     fingerprint["target_file_hashes"] = target_hashes
     fingerprint["pre_run_commit"] = pre_commit
     fingerprint["post_run_commit"] = post_commit
@@ -625,6 +644,10 @@ def main() -> int:
             f"[C2C Record v2.0] FAIL-CLOSED ERROR: Scope containment failed! Violations: {fingerprint.get('scope_violations')}",
             file=sys.stderr,
         )
+        return 2
+
+    if cmd_record["tests"]["failed"] > 0:
+        print("[C2C Record v2.0] FAIL-CLOSED ERROR: Test summary reports failures", file=sys.stderr)
         return 2
 
     return cmd_record["exit_code"]
