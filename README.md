@@ -41,3 +41,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider
 ```
 
 The tests use disposable Git repositories and test credentials only. MIT licensed. This public extraction excludes the original private workspace, its execution receipts and state.
+
+The scope regressions also include four **strict XFAIL** cases for ignored paths (temporary files, pytest cache and Python bytecode). They are executable demonstrations of a known gap, **not** passing containment coverage. A future implementation that detects them will produce XPASS and require deliberate test/README updates.
